@@ -2,6 +2,8 @@
 
 import subprocess
 
+from _gh_errors import raise_or_degrade_gh_error
+
 VALID_LABELS = {
     "bug",
     "documentation",
@@ -59,7 +61,7 @@ def apply_labels(issue_number: int, labels: list[str]) -> bool:
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
 
     if result.returncode != 0:
-        print(f"::warning::Failed to reconcile labels: {result.stderr}")
+        raise_or_degrade_gh_error(result.stderr, "Failed to reconcile labels")
         return False
 
     return True
