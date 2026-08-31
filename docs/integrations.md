@@ -1,9 +1,8 @@
 # Integration Paths
 
-Three non-breaking paths for users of `gha-issue-triage`. GitHub-Models default is preserved in all of them.
+Two non-breaking paths for users of `gha-issue-triage`. GitHub-Models default is preserved in both.
 
 - **Path 0** — Stay on GitHub Models, switch to a smaller/faster model via the existing `MODEL` input. **No code change.**
-- **Path A** — Use [`apps/claude`](https://github.com/apps/claude) for GitHub auth instead of `github.token`. **No code change.**
 - **Path B** — Add OpenAI-compatible backend (Mistral / Devstral / Ollama / vLLM). **One small change in `src/llm.py` + new input.**
 
 ## Current Wiring (Reference)
@@ -62,24 +61,6 @@ What "the user making the call" means in each case is **not first-party document
 
 For low-volume repos, prefer the workflow default — zero secret management. If you hit `HTTP 429 Too Many Requests` from the inference endpoint, escalate to a PAT or switch to Path B (an OpenAI-compatible backend with its own quota).
 
-## Path A — Claude GitHub App auth
-
-```yaml
-- id: app-token
-  uses: actions/create-github-app-token@v1
-  with:
-    app-id: ${{ secrets.CLAUDE_APP_ID }}
-    private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
-
-- uses: qte77/gha-issue-triage@v0.2.4
-  with:
-    GH_TOKEN: ${{ steps.app-token.outputs.token }}
-```
-
-Effect: comments authored by `claude[bot]`, cross-repo scope, refreshable token. Requires `apps/claude` (or custom App with `issues: write`, `contents: read`) installed on the org.
-
-**Implementation effort: zero** — works today via existing `GH_TOKEN` input.
-
 ## Path B — OpenAI-compatible backend (Mistral / Cerebras / Ollama / ...)
 
 Shipped in [#11](https://github.com/qte77/gha-issue-triage/issues/11) (action ≥0.2.0). Any OpenAI-compatible Chat Completions endpoint plugs in via the `OPENAI_API_BASE` input — Mistral, Cerebras, Groq, Together, Fireworks, vLLM, Ollama. `AI_TOKEN` is sent as a Bearer; `MODEL` selects the model. Localhost `http://` is allowed for self-hosted; all other URLs must be `https://`.
@@ -131,7 +112,6 @@ with:
 | --- | --- | --- |
 | Low volume, public repo | **Path 0** (any free GH Models ID) | Free, rate limits sufficient |
 | Code-heavy repo, want better feasibility scoring | **Path 0 + DeepSeek** | `deepseek-v3-0324` for code understanding |
-| Want branded `claude[bot]` author + cross-repo auth | **Path A** | Caller-side only |
 | High volume, free tier exhausted | **Path B** (Devstral API) | ~45× cheaper than Sonnet |
 | Privacy / compliance | **Path B** (self-hosted) | No API egress |
 
@@ -139,7 +119,86 @@ with:
 
 1. Optionally make the Anthropic model `MODEL`-driven when `ANTHROPIC_API_KEY` is set (Sonnet 4.6 is the current hardcoded default)
 
+## Troubleshooting
+
+When the action hits an auth/API failure it posts a sticky comment to the
+triggering issue (via `src/comment.py:post_failure`) and exits non-zero so
+CI stays red. Each class below corresponds to a `TriageFailure.class_name`
+value emitted by the action. The comment posted to the issue links to this
+section via anchor.
+
+### `missing-models-perm` — HTTP 401/403 from GitHub Models
+
+The action's LLM call to `models.github.ai` was rejected. The most common
+cause is a missing `permissions: models: read` block in the caller workflow.
+Add `permissions: models: read` to your workflow, or supply a PAT via the
+`AI_TOKEN` input (classic PAT — no scope required; fine-grained PAT — grant
+*Models: Read-only*). See [Auth for `AI_TOKEN`](#auth-for-ai_token) above.
+
+### `invalid-anthropic-key` — HTTP 401 from Anthropic
+
+`ANTHROPIC_API_KEY` is set but was rejected by `api.anthropic.com`. Rotate
+the key in your repository secrets, or unset `ANTHROPIC_API_KEY` entirely to
+fall back to the GitHub Models backend.
+
+### `invalid-ai-token` — HTTP 401 from OpenAI-compatible endpoint
+
+The Bearer token in `AI_TOKEN` was rejected by the custom `OPENAI_API_BASE`
+endpoint. Verify the key is valid for that provider and that the endpoint URL
+is correct.
+
+### `llm-rate-limit` — HTTP 429 from LLM backend
+
+The LLM backend returned a rate-limit response. Re-run the workflow after
+the `Retry-After` window elapses. For sustained traffic, supply a PAT via
+`AI_TOKEN` (higher per-user quota) or switch to an OpenAI-compatible backend
+(Path B above) with its own quota.
+
+### `llm-upstream` — HTTP 5xx from LLM backend
+
+A transient upstream error was returned by the LLM provider. No caller change
+is needed — re-run the workflow.
+
+### `llm-network` — Network/TLS error reaching LLM backend
+
+The runner could not reach the LLM host (DNS failure, TLS error, etc.).
+This is typically a transient runner-side issue. Re-run the workflow.
+
+### `missing-issues-write` — HTTP 403 from `gh issue edit` / `gh issue comment` / `gh label create`
+
+The caller workflow's `GITHUB_TOKEN` lacks the `issues: write` permission.
+Add the following to the job that calls this action:
+
+```yaml
+permissions:
+  issues: write
+```
+
+### `fork-pr-readonly-token` — HTTP 403 with "Resource not accessible by integration"
+
+The action was triggered from a forked-repository pull request, where
+`GITHUB_TOKEN` is read-only by GitHub security policy. The action cannot
+apply labels or post comments in this context. If you need triage on forked
+PRs, use `pull_request_target` instead of `pull_request` — but read the
+[security implications][pr-target-docs] carefully before doing so.
+
+### `not-found` — HTTP 404 from any `gh` call
+
+The action could not reach the issue or repository. Common causes:
+- `GH_TOKEN` scope is too narrow (private repos require the `repo` scope)
+- The issue number or repository slug in the event payload is incorrect
+
+Supply a fine-grained PAT or classic PAT with `repo` scope via `GH_TOKEN`.
+
+### `gh-rate-limit` — HTTP 429 from GitHub API
+
+The GitHub REST API rate-limit was hit. Re-run the workflow after the limit
+resets (typically within an hour). For high-volume repositories, supply a
+PAT via `GH_TOKEN` — authenticated requests use a higher per-user quota than
+the default `GITHUB_TOKEN` (`github-actions[bot]`).
+
 [gh-models-cat]: https://github.com/marketplace/models
 [gh-models-docs]: https://docs.github.com/en/github-models/use-github-models/prototyping-with-ai-models
 [devstral-card]: https://huggingface.co/mistralai/Devstral-Small-2-24B-Instruct-2512
 [mistral-api]: https://docs.mistral.ai/
+[pr-target-docs]: https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request_target
